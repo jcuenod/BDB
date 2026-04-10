@@ -1,0 +1,43 @@
+{
+  "Bwhebb": {},
+  "greek": {},
+  "arabic": {
+    "4 dele questionmark": "ش",
+    "4abeq": "شبق",
+    "4ame4": "شمش",
+    "9alem": "علم",
+    "bt.el": "بطل",
+    "h.adet": "حدت",
+    "h.eblo0": "حَبْلَا",
+    "hode0": "هدا",
+    "kerokumun": "كُرْكُمٌ",
+    "mawozane0": "مَوْزَنَا",
+    "mazile0": "مَزِلَا",
+    "qet.ro0": "قِطْرَا",
+    "qieot.a0lah;un": "قِرْطَالَةٌ",
+    "que=ah;un": "قُوَّةٌ",
+    "zhem": "زهم"
+  },
+  "syriac": {
+    "03sar": "ܥܣܪ",
+    "0n*": "ܐܢ",
+    "seduwno0]": "ܣܕܘܢܐ"
+  },
+  "ethiopic": {
+    "guwbno0": "ጉብኖእ"
+  },
+  "samaritan": {},
+  "persian": {
+    "ganojah": "گنج",
+    "glym": "گلیم",
+    "gnjw0ra jaza0": "گنجور جزا",
+    "guwz": "گوز",
+    "knbd": "گنبد",
+    "nubi4otn": "نبشتن",
+    "nuwi4otn": "نوشتن",
+    "p0lyz": "پالیز",
+    "pa0osi": "پارسی",
+    "puwla0d": "پولاد",
+    "zrri4tah": "زرّشته"
+  }
+}

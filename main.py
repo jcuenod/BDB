@@ -12,7 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_INPUT = ROOT / "data" / "raw.html"
-DEFAULT_OUTPUT = ROOT / "data" / "legal_unicode.html"
+DEFAULT_OUTPUT = ROOT / "output" / "bdb.html"
 BWHEBB_TSV = ROOT / "data" / "bhwebb-unicode-map.tsv"
 BWHEBB_AUTHORITATIVE = ROOT / "fixtures" / "bwhebb_authoritative_map.json"
 BWHEBB_OVERRIDES = ROOT / "fixtures" / "bwhebb_overrides.json"
@@ -1119,6 +1119,7 @@ def main() -> None:
     script_overrides = load_json(SCRIPT_OVERRIDES)
     raw_html = args.input.read_text(encoding="utf-8")
     converted = convert_document(raw_html, bwhebb_map=bwhebb_map, script_overrides=script_overrides)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(converted, encoding="utf-8")
     if args.report:
         print(json.dumps(build_report(raw_html, converted), ensure_ascii=False, indent=2))

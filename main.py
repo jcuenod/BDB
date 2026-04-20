@@ -17,6 +17,7 @@ BWHEBB_TSV = ROOT / "data" / "bhwebb-unicode-map.tsv"
 BWHEBB_AUTHORITATIVE = ROOT / "fixtures" / "bwhebb_authoritative_map.json"
 BWHEBB_OVERRIDES = ROOT / "fixtures" / "bwhebb_overrides.json"
 SCRIPT_OVERRIDES = ROOT / "fixtures" / "script_overrides.json"
+XBR_OVERRIDES = ROOT / "fixtures" / "xbr_overrides.json"
 
 SPECIAL_SPAN_CLASSES = {
     "Bwhebb",
@@ -311,6 +312,100 @@ ASCII_PLACEHOLDER_MAP = {
         ("’", "ʾ"),
     ],
 }
+
+# Some legacy <xbr> tags in the source wrap bibliography page numbers or years
+# that only resemble scripture refs. Keep the clickable ref treatment for
+# structurally plausible citations and fall back to plain text otherwise.
+BOOK_CHAPTER_LIMITS = {
+    "GE": 50,
+    "GN": 50,
+    "EX": 40,
+    "LE": 27,
+    "LV": 27,
+    "NU": 36,
+    "DE": 34,
+    "DT": 34,
+    "JOS": 24,
+    "JO": 24,
+    "JDG": 21,
+    "RU": 4,
+    "1SA": 31,
+    "2SA": 24,
+    "1KI": 22,
+    "2KI": 25,
+    "1CH": 29,
+    "2CH": 36,
+    "EZ": 10,
+    "EZR": 10,
+    "NE": 13,
+    "ES": 10,
+    "JOB": 42,
+    "PS": 150,
+    "PR": 31,
+    "EC": 12,
+    "SO": 8,
+    "IS": 66,
+    "JE": 52,
+    "LA": 5,
+    "EZE": 48,
+    "DA": 12,
+    "HO": 14,
+    "JOE": 4,
+    "AM": 9,
+    "OB": 1,
+    "JON": 4,
+    "MIC": 7,
+    "NA": 3,
+    "HAB": 3,
+    "HAG": 2,
+    "ZEC": 14,
+    "ZEP": 3,
+    "MAL": 4,
+    "MT": 28,
+    "MK": 16,
+    "LU": 24,
+    "JN": 21,
+    "AC": 28,
+    "RO": 16,
+    "1CO": 16,
+    "GA": 6,
+    "EPH": 6,
+    "PHP": 4,
+    "TIT": 3,
+    "HEB": 13,
+    "JAM": 5,
+    "1PE": 5,
+    "2PE": 3,
+    "1JN": 5,
+    "REV": 22,
+    "TOB": 14,
+    "JUD": 16,
+    "WIS": 19,
+    "SIR": 51,
+    "BAR": 6,
+    "BEL": 1,
+    "1MA": 16,
+    "2MA": 15,
+}
+
+SINGLE_CHAPTER_BOOK_VERSE_LIMITS = {
+    "OB": 21,
+    "BEL": 42,
+}
+
+SIMPLE_SCRIPTURE_REF_PATTERN = re.compile(
+    r"^(?P<book>[1-3]?[A-Za-z]+)\.?\s+(?P<chapter>\d+)(?::(?P<verse>\d+))?(?P<suffix>[a-z]?)$"
+)
+CHAPTER_RANGE_PATTERN = re.compile(r"^(?P<book>[1-3]?[A-Za-z]+)\.?\s+(?P<start>\d+)-(?P<end>\d+)$")
+CHAPTER_TO_VERSE_RANGE_PATTERN = re.compile(
+    r"^(?P<book>[1-3]?[A-Za-z]+)\.?\s+(?P<start>\d+)-(?P<end>\d+):(?P<verse>\d+)$"
+)
+VERSE_RANGE_PATTERN = re.compile(
+    r"^(?P<book>[1-3]?[A-Za-z]+)\.?\s+(?P<chapter>\d+):(?P<start>\d+)-(?P<end>\d+)$"
+)
+CROSS_CHAPTER_RANGE_PATTERN = re.compile(
+    r"^(?P<book>[1-3]?[A-Za-z]+)\.?\s+(?P<start_chapter>\d+):(?P<start_verse>\d+)-(?P<end_chapter>\d+):(?P<end_verse>\d+)$"
+)
 
 
 def load_json(path: Path) -> dict:
@@ -859,11 +954,111 @@ def render_start_tag(tag: str, attrs: list[tuple[str, str | None]], self_closing
     return f"<{tag}{attr_blob}{closer}>"
 
 
+def is_plausible_scripture_ref(target: str) -> bool:
+    normalized = target.strip()
+
+    def get_limits(book_token: str) -> tuple[str, int] | None:
+        book = book_token.upper()
+        max_chapters = BOOK_CHAPTER_LIMITS.get(book)
+        if max_chapters is None:
+            return None
+        return book, max_chapters
+
+    def is_valid_chapter(book: str, max_chapters: int, chapter: int) -> bool:
+        if max_chapters == 1:
+            max_verse = SINGLE_CHAPTER_BOOK_VERSE_LIMITS.get(book)
+            return max_verse is None or 1 <= chapter <= max_verse
+        return 1 <= chapter <= max_chapters
+
+    def is_valid_verse(book: str, max_chapters: int, chapter: int, verse: int) -> bool:
+        if verse < 1 or chapter < 1 or chapter > max_chapters:
+            return False
+        if max_chapters == 1:
+            max_verse = SINGLE_CHAPTER_BOOK_VERSE_LIMITS.get(book)
+            return chapter == 1 and (max_verse is None or verse <= max_verse)
+        return True
+
+    match = SIMPLE_SCRIPTURE_REF_PATTERN.fullmatch(normalized)
+    if match:
+        limits = get_limits(match.group("book"))
+        if limits is None:
+            return False
+        book, max_chapters = limits
+        chapter = int(match.group("chapter"))
+        verse_text = match.group("verse")
+        if verse_text is None:
+            return is_valid_chapter(book, max_chapters, chapter)
+        return is_valid_verse(book, max_chapters, chapter, int(verse_text))
+
+    match = CHAPTER_RANGE_PATTERN.fullmatch(normalized)
+    if match:
+        limits = get_limits(match.group("book"))
+        if limits is None:
+            return False
+        book, max_chapters = limits
+        start = int(match.group("start"))
+        end = int(match.group("end"))
+        if start > end:
+            return False
+        if max_chapters == 1:
+            max_verse = SINGLE_CHAPTER_BOOK_VERSE_LIMITS.get(book)
+            return max_verse is None or (1 <= start <= end <= max_verse)
+        return is_valid_chapter(book, max_chapters, start) and is_valid_chapter(book, max_chapters, end)
+
+    match = CHAPTER_TO_VERSE_RANGE_PATTERN.fullmatch(normalized)
+    if match:
+        limits = get_limits(match.group("book"))
+        if limits is None:
+            return False
+        book, max_chapters = limits
+        start = int(match.group("start"))
+        end = int(match.group("end"))
+        verse = int(match.group("verse"))
+        return start <= end and is_valid_chapter(book, max_chapters, start) and is_valid_verse(book, max_chapters, end, verse)
+
+    match = VERSE_RANGE_PATTERN.fullmatch(normalized)
+    if match:
+        limits = get_limits(match.group("book"))
+        if limits is None:
+            return False
+        book, max_chapters = limits
+        chapter = int(match.group("chapter"))
+        start = int(match.group("start"))
+        end = int(match.group("end"))
+        return start <= end and is_valid_verse(book, max_chapters, chapter, start) and is_valid_verse(
+            book, max_chapters, chapter, end
+        )
+
+    match = CROSS_CHAPTER_RANGE_PATTERN.fullmatch(normalized)
+    if match:
+        limits = get_limits(match.group("book"))
+        if limits is None:
+            return False
+        book, max_chapters = limits
+        start_chapter = int(match.group("start_chapter"))
+        start_verse = int(match.group("start_verse"))
+        end_chapter = int(match.group("end_chapter"))
+        end_verse = int(match.group("end_verse"))
+        if (start_chapter, start_verse) > (end_chapter, end_verse):
+            return False
+        return is_valid_verse(book, max_chapters, start_chapter, start_verse) and is_valid_verse(
+            book, max_chapters, end_chapter, end_verse
+        )
+
+    return False
+
+
 class LexiconHTMLConverter(HTMLParser):
-    def __init__(self, bwhebb_map: dict[str, str], script_overrides: dict[str, dict[str, str]]):
+    def __init__(
+        self,
+        bwhebb_map: dict[str, str],
+        script_overrides: dict[str, dict[str, str]],
+        xbr_overrides: dict[str, str],
+    ):
         super().__init__(convert_charrefs=True)
         self.bwhebb_map = bwhebb_map
         self.script_overrides = script_overrides
+        self.xbr_overrides = xbr_overrides
         self.output: list[str] = []
         self.capture_stack: list[dict] = []
 
@@ -918,8 +1113,14 @@ class LexiconHTMLConverter(HTMLParser):
         if self.capture_stack and self.capture_stack[-1]["kind"] == "xbr" and tag == "xbr":
             capture = self.capture_stack.pop()
             text = "".join(capture["buffer"]).strip()
-            target = html.escape(capture["target"], quote=True)
-            self.output.append(f"<span class=\"ref\" data-ref=\"{target}\">{html.escape(text, quote=False)}</span>")
+            target = self.xbr_overrides.get(capture["target"], capture["target"])
+            if is_plausible_scripture_ref(target):
+                escaped_target = html.escape(target, quote=True)
+                self.output.append(
+                    f"<span class=\"ref\" data-ref=\"{escaped_target}\">{html.escape(text, quote=False)}</span>"
+                )
+            else:
+                self.output.append(html.escape(text, quote=False))
             return
 
         if self.capture_stack and self.capture_stack[-1]["kind"] == "span" and tag == "span":
@@ -970,8 +1171,17 @@ class LexiconHTMLConverter(HTMLParser):
         return "".join(self.output)
 
 
-def convert_document(raw_html: str, bwhebb_map: dict[str, str], script_overrides: dict[str, dict[str, str]]) -> str:
-    parser = LexiconHTMLConverter(bwhebb_map=bwhebb_map, script_overrides=script_overrides)
+def convert_document(
+    raw_html: str,
+    bwhebb_map: dict[str, str],
+    script_overrides: dict[str, dict[str, str]],
+    xbr_overrides: dict[str, str],
+) -> str:
+    parser = LexiconHTMLConverter(
+        bwhebb_map=bwhebb_map,
+        script_overrides=script_overrides,
+        xbr_overrides=xbr_overrides,
+    )
     parser.feed(normalize_raw_html(raw_html))
     parser.close()
     output = parser.get_output()
@@ -1117,8 +1327,14 @@ def main() -> None:
 
     bwhebb_map = load_bwhebb_map(BWHEBB_TSV, BWHEBB_AUTHORITATIVE, BWHEBB_OVERRIDES)
     script_overrides = load_json(SCRIPT_OVERRIDES)
+    xbr_overrides = load_json(XBR_OVERRIDES)
     raw_html = args.input.read_text(encoding="utf-8")
-    converted = convert_document(raw_html, bwhebb_map=bwhebb_map, script_overrides=script_overrides)
+    converted = convert_document(
+        raw_html,
+        bwhebb_map=bwhebb_map,
+        script_overrides=script_overrides,
+        xbr_overrides=xbr_overrides,
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(converted, encoding="utf-8")
     if args.report:

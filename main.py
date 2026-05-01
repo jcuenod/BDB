@@ -6,6 +6,9 @@ import argparse
 import html
 import json
 import re
+import unicodedata
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -13,12 +16,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DEFAULT_INPUT = ROOT / "data" / "raw.html"
 DEFAULT_OUTPUT = ROOT / "output" / "bdb.html"
+DEFAULT_ENTRIES_OUTPUT = ROOT / "output" / "entries.html"
+DEFAULT_LEXICAL_INDEX = ROOT / "data" / "LexicalIndex.xml"
 BWHEBB_TSV = ROOT / "data" / "bhwebb-unicode-map.tsv"
 BWHEBB_AUTHORITATIVE = ROOT / "fixtures" / "bwhebb_authoritative_map.json"
 BWHEBB_OVERRIDES = ROOT / "fixtures" / "bwhebb_overrides.json"
 BWHEBB_X_AS_TSADI = ROOT / "fixtures" / "bwhebb_x_as_tsadi.json"
 SCRIPT_OVERRIDES = ROOT / "fixtures" / "script_overrides.json"
 XBR_OVERRIDES = ROOT / "fixtures" / "xbr_overrides.json"
+ENTRY_BDB_OVERRIDES = ROOT / "fixtures" / "entry_bdb_overrides.json"
 
 SPECIAL_SPAN_CLASSES = {
     "Bwhebb",
@@ -413,6 +419,23 @@ def load_json(path: Path) -> dict:
     if not path.exists():
         return {}
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_entry_bdb_overrides(path: Path) -> dict[int, str]:
+    raw_overrides = load_json(path)
+    if not raw_overrides:
+        return {}
+    if not isinstance(raw_overrides, dict):
+        raise ValueError(f"{path} must contain a JSON object mapping entry numbers to BDB codes.")
+
+    overrides: dict[int, str] = {}
+    for raw_entrynum, raw_bdb in raw_overrides.items():
+        if not isinstance(raw_entrynum, str) or not raw_entrynum.isdigit():
+            raise ValueError(f"{path} has an invalid entry number key: {raw_entrynum!r}")
+        if not isinstance(raw_bdb, str) or not raw_bdb.strip():
+            raise ValueError(f"{path} has an invalid BDB code for entry {raw_entrynum!r}: {raw_bdb!r}")
+        overrides[int(raw_entrynum)] = raw_bdb.strip()
+    return overrides
 
 
 def load_bwhebb_x_as_tsadi(path: Path) -> tuple[dict[str, tuple[int, ...]], dict[int, dict[str, tuple[int, ...]]]]:
@@ -1448,10 +1471,551 @@ def build_report(raw_html: str, converted_html: str) -> dict[str, object]:
     }
 
 
+@dataclass(frozen=True)
+class LexicalEntry:
+    lexical_id: str
+    bdb: str
+    word: str
+    normalized_word: str
+    xlit: str
+    pos: str
+    definition: str
+    strongs: tuple[str, ...]
+    twot: str
+    etym_type: str
+
+
+@dataclass(frozen=True)
+class ConvertedEntry:
+    entrynum: int
+    paragraph_attrs: str
+    page_html: str
+    page_text: str
+    body_html: str
+    strongs: tuple[str, ...]
+    hebrew_keys: tuple[str, ...]
+
+
+ENTRY_PARAGRAPH_PATTERN = re.compile(
+    r"<p\b(?P<attrs>[^>]*)>\s*<entry><entrynum>(?P<entrynum>\d+)</entrynum>(?P<body>.*?)</p>",
+    re.S,
+)
+PAGE_PATTERN = re.compile(r"^\s*<page>(?P<page>.*?)</page>", re.S)
+LEFTOVER_PAGE_START_PATTERN = re.compile(r"<(?P<prefix>[^<>/]*?)page(?:\s[^<>]*)?>", re.I)
+LEFTOVER_PAGE_END_PATTERN = re.compile(r"</page\s*>", re.I)
+TAG_PATTERN = re.compile(r"<[^>]+>")
+
+
+def local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def child_text(element: ET.Element, name: str) -> str:
+    for child in element:
+        if local_name(child.tag) == name:
+            return "".join(child.itertext()).strip()
+    return ""
+
+
+def child_element(element: ET.Element, name: str) -> ET.Element | None:
+    for child in element:
+        if local_name(child.tag) == name:
+            return child
+    return None
+
+
+def normalize_hebrew_key(text: str) -> str:
+    normalized = unicodedata.normalize("NFD", html.unescape(text))
+    return "".join(character for character in normalized if "\u05d0" <= character <= "\u05ea")
+
+
+def strip_tags(fragment: str) -> str:
+    return html.unescape(TAG_PATTERN.sub("", fragment)).strip()
+
+
+def clean_leftover_page_markup(fragment: str) -> str:
+    def replace_start(match: re.Match[str]) -> str:
+        return html.escape(match.group("prefix"), quote=False)
+
+    fragment = LEFTOVER_PAGE_START_PATTERN.sub(replace_start, fragment)
+    return LEFTOVER_PAGE_END_PATTERN.sub("", fragment)
+
+
+def parse_lexical_index(path: Path) -> list[LexicalEntry]:
+    root = ET.parse(path).getroot()
+    entries: list[LexicalEntry] = []
+    for element in root.iter():
+        if local_name(element.tag) != "entry":
+            continue
+        xref = child_element(element, "xref")
+        if xref is None:
+            continue
+        bdb = xref.attrib.get("bdb", "").strip()
+        if not bdb:
+            continue
+        word = child_text(element, "w")
+        word_element = child_element(element, "w")
+        etym_element = child_element(element, "etym")
+        entries.append(
+            LexicalEntry(
+                lexical_id=element.attrib.get("id", ""),
+                bdb=bdb,
+                word=word,
+                normalized_word=normalize_hebrew_key(word),
+                xlit=word_element.attrib.get("xlit", "") if word_element is not None else "",
+                pos=child_text(element, "pos"),
+                definition=child_text(element, "def"),
+                strongs=tuple(re.findall(r"\d+", xref.attrib.get("strong", ""))),
+                twot=xref.attrib.get("twot", ""),
+                etym_type=etym_element.attrib.get("type", "") if etym_element is not None else "",
+            )
+        )
+    return entries
+
+
+def parse_converted_entries(converted_html: str) -> list[ConvertedEntry]:
+    entries: list[ConvertedEntry] = []
+    for match in ENTRY_PARAGRAPH_PATTERN.finditer(converted_html):
+        body_html = match.group("body")
+        page_html = ""
+        page_text = ""
+        page_match = PAGE_PATTERN.match(body_html)
+        if page_match:
+            page_html = page_match.group("page")
+            page_text = strip_tags(page_html).rstrip(":")
+            body_html = body_html[page_match.end() :]
+        body_html = clean_leftover_page_markup(body_html)
+
+        strong_match = re.search(r'<span class="strongs-number">([^<]+)</span>', body_html)
+        strongs = tuple(re.findall(r"\d+", html.unescape(strong_match.group(1)))) if strong_match else ()
+        hebrew_keys = tuple(
+            key
+            for key in (normalize_hebrew_key(text) for text in re.findall(r'<span class="hebrew">([^<]*)</span>', body_html))
+            if key
+        )
+        entries.append(
+            ConvertedEntry(
+                entrynum=int(match.group("entrynum")),
+                paragraph_attrs=match.group("attrs"),
+                page_html=page_html,
+                page_text=page_text,
+                body_html=body_html.strip(),
+                strongs=strongs,
+                hebrew_keys=hebrew_keys[:8],
+            )
+        )
+    return entries
+
+
+def bdb_group(bdb: str) -> str:
+    parts = bdb.split(".")
+    return ".".join(parts[:2]) if len(parts) >= 2 else bdb
+
+
+def bdb_sort_key(bdb: str) -> tuple[str, ...]:
+    return tuple(bdb.split("."))
+
+
+def bdb_id(bdb: str) -> str:
+    return "bdb-" + re.sub(r"[^0-9A-Za-z]+", "-", bdb).strip("-")
+
+
+def unique_preserving_order(values: list[str] | tuple[str, ...]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            unique.append(value)
+    return unique
+
+
+def lexical_indexes(entries: list[LexicalEntry]) -> tuple[dict[str, list[LexicalEntry]], dict[str, list[LexicalEntry]], dict[str, int]]:
+    by_strong: dict[str, list[LexicalEntry]] = {}
+    by_word: dict[str, list[LexicalEntry]] = {}
+    order: dict[str, int] = {}
+    for index, entry in enumerate(entries):
+        order[entry.lexical_id or f"{entry.bdb}:{index}"] = index
+        if entry.normalized_word:
+            by_word.setdefault(entry.normalized_word, []).append(entry)
+        for strong in entry.strongs:
+            by_strong.setdefault(strong, []).append(entry)
+    return by_strong, by_word, order
+
+
+def lexical_order_key(entry: LexicalEntry, lexical_order: dict[str, int]) -> str:
+    if entry.lexical_id and entry.lexical_id in lexical_order:
+        return entry.lexical_id
+    return entry.bdb
+
+
+def score_lexical_candidate(
+    converted_entry: ConvertedEntry,
+    lexical_entry: LexicalEntry,
+    lexical_order: dict[str, int],
+    previous_index: int | None,
+    used_bdb_counts: dict[str, int],
+) -> tuple[int, int, int, int]:
+    score = 0
+    first_key = converted_entry.hebrew_keys[0] if converted_entry.hebrew_keys else ""
+    key_set = set(converted_entry.hebrew_keys)
+    strong_set = set(converted_entry.strongs)
+
+    if lexical_entry.strongs and strong_set.intersection(lexical_entry.strongs):
+        score += 45
+    if first_key and lexical_entry.normalized_word == first_key:
+        score += 100
+    elif lexical_entry.normalized_word in key_set:
+        score += 70
+    elif first_key and lexical_entry.normalized_word and (
+        first_key.startswith(lexical_entry.normalized_word) or lexical_entry.normalized_word.startswith(first_key)
+    ):
+        score += 25
+    if lexical_entry.etym_type == "main" and not converted_entry.strongs:
+        score += 10
+
+    index = lexical_order.get(lexical_order_key(lexical_entry, lexical_order), 0)
+    distance = abs(index - previous_index) if previous_index is not None else index
+    if previous_index is not None:
+        score += max(0, 25 - min(distance, 25))
+        if index + 20 < previous_index and not strong_set:
+            score -= 20
+    if lexical_entry.bdb.startswith("xa.") and previous_index is not None and previous_index < index - 500:
+        score -= 15
+
+    return (-score, used_bdb_counts.get(lexical_entry.bdb, 0), distance, index)
+
+
+def map_entries_to_bdb(
+    converted_entries: list[ConvertedEntry],
+    lexical_entries: list[LexicalEntry],
+    entry_bdb_overrides: dict[int, str] | None = None,
+) -> tuple[dict[str, list[ConvertedEntry]], list[ConvertedEntry]]:
+    by_strong, by_word, lexical_order = lexical_indexes(lexical_entries)
+    entry_bdb_overrides = entry_bdb_overrides or {}
+    valid_bdbs = {entry.bdb for entry in lexical_entries}
+    invalid_overrides = {
+        entrynum: bdb
+        for entrynum, bdb in entry_bdb_overrides.items()
+        if bdb not in valid_bdbs
+    }
+    if invalid_overrides:
+        details = ", ".join(f"{entrynum}: {bdb}" for entrynum, bdb in sorted(invalid_overrides.items())[:10])
+        raise ValueError(f"entry BDB override fixture references unknown BDB codes: {details}")
+
+    bdb_first_index: dict[str, int] = {}
+    for lexical_entry in lexical_entries:
+        index = lexical_order.get(lexical_order_key(lexical_entry, lexical_order))
+        if index is not None:
+            bdb_first_index.setdefault(lexical_entry.bdb, index)
+
+    mapped: dict[str, list[ConvertedEntry]] = {}
+    unmapped: list[ConvertedEntry] = []
+    used_bdb_counts: dict[str, int] = {}
+    previous_index: int | None = None
+
+    for converted_entry in converted_entries:
+        override_bdb = entry_bdb_overrides.get(converted_entry.entrynum)
+        if override_bdb:
+            mapped.setdefault(override_bdb, []).append(converted_entry)
+            used_bdb_counts[override_bdb] = used_bdb_counts.get(override_bdb, 0) + 1
+            previous_index = bdb_first_index.get(override_bdb, previous_index)
+            continue
+
+        candidate_pool: list[LexicalEntry] = []
+        for strong in converted_entry.strongs:
+            candidate_pool.extend(by_strong.get(strong, []))
+        if converted_entry.hebrew_keys:
+            candidate_pool.extend(by_word.get(converted_entry.hebrew_keys[0], []))
+        candidate_pool = list({entry.lexical_id or entry.bdb: entry for entry in candidate_pool}.values())
+
+        candidates = [
+            entry
+            for entry in candidate_pool
+            if converted_entry.hebrew_keys
+            and (
+                entry.normalized_word in set(converted_entry.hebrew_keys)
+                or (entry.normalized_word and entry.normalized_word.startswith(converted_entry.hebrew_keys[0]))
+                or (entry.normalized_word and converted_entry.hebrew_keys[0].startswith(entry.normalized_word))
+            )
+        ]
+        if not candidates:
+            unmapped.append(converted_entry)
+            continue
+
+        candidates.sort(
+            key=lambda entry: score_lexical_candidate(
+                converted_entry,
+                entry,
+                lexical_order,
+                previous_index,
+                used_bdb_counts,
+            )
+        )
+        lexical_entry = candidates[0]
+        mapped.setdefault(lexical_entry.bdb, []).append(converted_entry)
+        used_bdb_counts[lexical_entry.bdb] = used_bdb_counts.get(lexical_entry.bdb, 0) + 1
+        previous_index = lexical_order.get(lexical_order_key(lexical_entry, lexical_order), previous_index)
+
+    return mapped, unmapped
+
+
+def render_meta_span(label: str, value: str) -> str:
+    return f"<span><b>{html.escape(label)}:</b> {html.escape(value)}</span>"
+
+
+def render_entry_paragraph(entry: ConvertedEntry) -> str:
+    attrs = entry.paragraph_attrs
+    return f'<p{attrs} data-entrynum="{entry.entrynum}">{entry.body_html}</p>'
+
+
+def render_section(
+    bdb: str,
+    lexical_entries: list[LexicalEntry],
+    converted_entries: list[ConvertedEntry],
+) -> str:
+    words = unique_preserving_order([entry.word for entry in lexical_entries])
+    definitions = unique_preserving_order([entry.definition for entry in lexical_entries])
+    poses = unique_preserving_order([entry.pos for entry in lexical_entries])
+    strongs = unique_preserving_order([strong for entry in lexical_entries for strong in entry.strongs])
+    twots = unique_preserving_order([entry.twot for entry in lexical_entries])
+    lexical_ids = unique_preserving_order([entry.lexical_id for entry in lexical_entries])
+    entrynums = ", ".join(str(entry.entrynum) for entry in converted_entries)
+    pages = unique_preserving_order([entry.page_text for entry in converted_entries])
+
+    heading_words = " / ".join(words[:4]) or "Unindexed"
+    heading = (
+        f'<h3 id="{bdb_id(bdb)}"><span class="bdb-code">{html.escape(bdb)}</span> '
+        f'<span class="headwords" dir="rtl">{html.escape(heading_words)}</span></h3>'
+    )
+    summary = f'<p class="section-definition">{html.escape("; ".join(definitions[:3]))}</p>' if definitions else ""
+    meta_values = [
+        ("Entries", entrynums),
+        ("Pages", ", ".join(pages)),
+        ("POS", ", ".join(poses)),
+        ("Strong", ", ".join(strongs)),
+        ("TWOT", ", ".join(twots)),
+        ("Lexical IDs", ", ".join(lexical_ids)),
+    ]
+    meta = '<div class="entry-meta">' + "".join(render_meta_span(label, value) for label, value in meta_values if value) + "</div>"
+    body = "\n".join(render_entry_paragraph(entry) for entry in converted_entries)
+    return f'<section class="bdb-subentry" data-bdb="{html.escape(bdb)}">\n{heading}\n{summary}\n{meta}\n{body}\n</section>'
+
+
+def canonical_group_entry(group: str, lexical_entries: list[LexicalEntry]) -> LexicalEntry:
+    group_entries = [entry for entry in lexical_entries if bdb_group(entry.bdb) == group]
+    for entry in group_entries:
+        if entry.etym_type == "main":
+            return entry
+    for entry in group_entries:
+        if entry.bdb.endswith(".aa"):
+            return entry
+    return group_entries[0]
+
+
+def render_article(
+    group: str,
+    group_bdbs: list[str],
+    entries_by_bdb: dict[str, list[LexicalEntry]],
+    converted_by_bdb: dict[str, list[ConvertedEntry]],
+    lexical_entries: list[LexicalEntry],
+) -> str:
+    canonical = canonical_group_entry(group, lexical_entries)
+    section_html = "\n".join(
+        render_section(bdb, entries_by_bdb.get(bdb, []), converted_by_bdb[bdb])
+        for bdb in group_bdbs
+        if converted_by_bdb.get(bdb)
+    )
+    definition = f'<p class="article-definition">{html.escape(canonical.definition)}</p>' if canonical.definition else ""
+    return (
+        f'<article class="bdb-entry" id="{bdb_id(group)}" data-bdb-group="{html.escape(group)}">\n'
+        f'<header class="article-header"><h2><span class="bdb-code">{html.escape(group)}</span> '
+        f'<span class="headwords" dir="rtl">{html.escape(canonical.word)}</span></h2>{definition}</header>\n'
+        f"{section_html}\n"
+        "</article>"
+    )
+
+
+def render_unmapped_entries(unmapped_entries: list[ConvertedEntry]) -> str:
+    if not unmapped_entries:
+        return ""
+    body = "\n".join(render_entry_paragraph(entry) for entry in unmapped_entries)
+    return (
+        '<section class="unmapped-entries" id="unindexed-entries">\n'
+        "<h2>Unindexed Entries</h2>\n"
+        '<p class="article-definition">Entries that could not be confidently aligned with LexicalIndex.xml.</p>\n'
+        f"{body}\n"
+        "</section>"
+    )
+
+
+def entries_styles() -> str:
+    return """
+body {
+  margin: 0;
+  color: #1d1d1b;
+  background: #fbfaf7;
+  font-family: Georgia, "Times New Roman", serif;
+  line-height: 1.55;
+}
+main {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 32px 24px 80px;
+}
+.document-header {
+  border-bottom: 2px solid #1d1d1b;
+  margin-bottom: 28px;
+  padding-bottom: 16px;
+}
+h1, h2, h3 {
+  line-height: 1.2;
+  margin: 0;
+}
+h1 {
+  font-size: 2rem;
+}
+.bdb-entry {
+  border-top: 1px solid #bbb4a8;
+  padding: 26px 0 8px;
+}
+.article-header {
+  margin-bottom: 18px;
+}
+.article-header h2 {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 1.55rem;
+}
+.bdb-subentry {
+  margin: 18px 0 24px;
+  padding-left: 18px;
+  border-left: 4px solid #d4c8ad;
+}
+.bdb-subentry h3 {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 1.15rem;
+}
+.bdb-code {
+  color: #6a4f1c;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.82em;
+}
+.headwords,
+.hebrew {
+  font-family: "SBL Hebrew", "Ezra SIL", "Times New Roman", serif;
+}
+.section-definition,
+.article-definition {
+  color: #57524a;
+  margin: 6px 0 10px;
+}
+.entry-meta {
+  color: #5d5a54;
+  display: flex;
+  flex-wrap: wrap;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-size: 0.78rem;
+  gap: 6px 14px;
+  margin: 8px 0 10px;
+}
+.entry-meta span {
+  white-space: nowrap;
+}
+p.p {
+  margin: 10px 0;
+}
+.strongs-number {
+  color: #785f28;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.ref {
+  color: #245f73;
+}
+.arabic,
+.syriac,
+.samaritan,
+.persian {
+  direction: rtl;
+  unicode-bidi: isolate;
+}
+.unmapped-entries {
+  border-top: 2px solid #8c7b61;
+  margin-top: 36px;
+  padding-top: 24px;
+}
+"""
+
+
+def build_entries_document(converted_html: str, lexical_index_path: Path, entry_bdb_overrides_path: Path) -> str:
+    lexical_entries = parse_lexical_index(lexical_index_path)
+    converted_entries = parse_converted_entries(converted_html)
+    entry_bdb_overrides = load_entry_bdb_overrides(entry_bdb_overrides_path)
+    converted_by_bdb, unmapped_entries = map_entries_to_bdb(
+        converted_entries,
+        lexical_entries,
+        entry_bdb_overrides,
+    )
+
+    entries_by_bdb: dict[str, list[LexicalEntry]] = {}
+    for entry in lexical_entries:
+        entries_by_bdb.setdefault(entry.bdb, []).append(entry)
+
+    bdbs_by_group: dict[str, list[str]] = {}
+    for bdb in sorted(converted_by_bdb, key=bdb_sort_key):
+        bdbs_by_group.setdefault(bdb_group(bdb), []).append(bdb)
+
+    articles = "\n".join(
+        render_article(group, bdbs, entries_by_bdb, converted_by_bdb, lexical_entries)
+        for group, bdbs in sorted(bdbs_by_group.items(), key=lambda item: bdb_sort_key(item[0]))
+    )
+    unmapped = render_unmapped_entries(unmapped_entries)
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="en">\n'
+        "<head>\n"
+        '<meta charset="utf-8"/>\n'
+        "<title>BDB Entries</title>\n"
+        f"<style>{entries_styles()}</style>\n"
+        "</head>\n"
+        "<body>\n"
+        "<main>\n"
+        '<header class="document-header"><h1>The Brown-Driver-Briggs Hebrew and English Lexicon: Entries</h1></header>\n'
+        f"{articles}\n"
+        f"{unmapped}\n"
+        "</main>\n"
+        "</body>\n"
+        "</html>\n"
+    )
+
+
 def main() -> None:
     argument_parser = argparse.ArgumentParser(description="Convert BDB raw HTML into normalized Unicode HTML.")
     argument_parser.add_argument("--input", type=Path, default=DEFAULT_INPUT, help="Path to the raw source HTML.")
     argument_parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="Path to write the converted HTML.")
+    argument_parser.add_argument(
+        "--entries-output",
+        type=Path,
+        default=DEFAULT_ENTRIES_OUTPUT,
+        help="Path to write the entry-structured HTML.",
+    )
+    argument_parser.add_argument(
+        "--lexical-index",
+        type=Path,
+        default=DEFAULT_LEXICAL_INDEX,
+        help="Path to LexicalIndex.xml for BDB entry grouping.",
+    )
+    argument_parser.add_argument(
+        "--entry-bdb-overrides",
+        type=Path,
+        default=ENTRY_BDB_OVERRIDES,
+        help="Path to JSON overrides for assigning converted entry numbers to BDB codes.",
+    )
     argument_parser.add_argument(
         "--report",
         action="store_true",
@@ -1474,6 +2038,9 @@ def main() -> None:
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(converted, encoding="utf-8")
+    entries_html = build_entries_document(converted, args.lexical_index, args.entry_bdb_overrides)
+    args.entries_output.parent.mkdir(parents=True, exist_ok=True)
+    args.entries_output.write_text(entries_html, encoding="utf-8")
     if args.report:
         print(json.dumps(build_report(raw_html, converted), ensure_ascii=False, indent=2))
 

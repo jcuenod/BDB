@@ -1,7 +1,7 @@
 {
   "_meta": {
     "description": "Position-specific overrides for raw Bwhebb lowercase x when it encodes tsadi rather than het. Positions are source-key consonant indexes; # remains final tsadi and is not counted as ambiguous x.",
-    "generated_from": "data/raw.html + /tmp/DictBDB.json, with manual review entries for short/standalone x references"
+    "generated_from": "data/raw.html + /tmp/DictBDB.json, with manual (LLM) review entries for short/standalone x references"
   },
   "global_profiles": {
     "!ABxa": [

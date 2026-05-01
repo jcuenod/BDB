@@ -16,6 +16,7 @@ DEFAULT_OUTPUT = ROOT / "output" / "bdb.html"
 BWHEBB_TSV = ROOT / "data" / "bhwebb-unicode-map.tsv"
 BWHEBB_AUTHORITATIVE = ROOT / "fixtures" / "bwhebb_authoritative_map.json"
 BWHEBB_OVERRIDES = ROOT / "fixtures" / "bwhebb_overrides.json"
+BWHEBB_X_AS_TSADI = ROOT / "fixtures" / "bwhebb_x_as_tsadi.json"
 SCRIPT_OVERRIDES = ROOT / "fixtures" / "script_overrides.json"
 XBR_OVERRIDES = ROOT / "fixtures" / "xbr_overrides.json"
 
@@ -414,6 +415,58 @@ def load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def load_bwhebb_x_as_tsadi(path: Path) -> tuple[dict[str, tuple[int, ...]], dict[int, dict[str, tuple[int, ...]]]]:
+    raw_overrides = load_json(path)
+
+    def valid_positions(key: str, raw_positions: object) -> tuple[int, ...] | None:
+        if not isinstance(key, str) or "x" not in key or not isinstance(raw_positions, list):
+            return None
+        positions = tuple(
+            sorted(
+                {
+                    position
+                    for position in raw_positions
+                    if isinstance(position, int) and 0 <= position < len(key) and key[position] == "x"
+                }
+            )
+        )
+        return positions
+
+    global_profiles: dict[str, tuple[int, ...]] = {}
+    for key, raw_positions in raw_overrides.get("global_profiles", {}).items():
+        positions = valid_positions(key, raw_positions)
+        if positions is not None:
+            global_profiles[key] = positions
+
+    entry_profiles: dict[int, dict[str, tuple[int, ...]]] = {}
+    for raw_entrynum, raw_profiles in raw_overrides.get("entry_profiles", {}).items():
+        if not raw_entrynum.isdigit() or not isinstance(raw_profiles, dict):
+            continue
+        profiles = {
+            key: positions
+            for key, raw_positions in raw_profiles.items()
+            if (positions := valid_positions(key, raw_positions)) is not None
+        }
+        if profiles:
+            entry_profiles[int(raw_entrynum)] = profiles
+
+    # Backward compatibility for the first small hand-written fixture. These old
+    # entries only represented words with one ambiguous x, so all x positions are
+    # the intended tsadi positions.
+    for skeleton in raw_overrides.get("global_skeletons", []):
+        if isinstance(skeleton, str) and "x" in skeleton:
+            global_profiles.setdefault(skeleton, tuple(i for i, character in enumerate(skeleton) if character == "x"))
+    for raw_entrynum, raw_skeletons in raw_overrides.get("entry_skeletons", {}).items():
+        if not raw_entrynum.isdigit() or not isinstance(raw_skeletons, list):
+            continue
+        profiles = entry_profiles.setdefault(int(raw_entrynum), {})
+        for skeleton in raw_skeletons:
+            if isinstance(skeleton, str) and "x" in skeleton:
+                profiles.setdefault(skeleton, tuple(i for i, character in enumerate(skeleton) if character == "x"))
+
+    return global_profiles, entry_profiles
+
+
 def apply_codepoint_overrides(mapping: dict[str, str], overrides: dict[str, str]) -> None:
     for source, target in overrides.items():
         if re.fullmatch(r"0x[0-9A-Fa-f]+", source):
@@ -436,6 +489,19 @@ def load_bwhebb_map(tsv_path: Path, authoritative_path: Path, overrides_path: Pa
     apply_codepoint_overrides(mapping, load_json(authoritative_path))
     apply_codepoint_overrides(mapping, load_json(overrides_path))
     return mapping
+
+
+def bwhebb_source_key(text: str, bwhebb_map: dict[str, str]) -> str:
+    key: list[str] = []
+    for character in text:
+        mapped = bwhebb_map.get(character, "")
+        if any(is_hebrew_letter(mapped_character) for mapped_character in mapped):
+            key.append(character)
+    return "".join(key)
+
+
+def source_parts(text: str) -> list[str]:
+    return re.split(r"([\s-]+)", text)
 
 
 def clean_comment(content: str) -> str:
@@ -480,19 +546,56 @@ def normalize_hebrew_output(text: str) -> str:
     return normalized
 
 
-def convert_bwhebb_text(text: str, bwhebb_map: dict[str, str], overrides: dict[str, str]) -> str:
+def convert_bwhebb_text(
+    text: str,
+    bwhebb_map: dict[str, str],
+    overrides: dict[str, str],
+    *,
+    global_tsadi_profiles: dict[str, tuple[int, ...]] | None = None,
+    entry_tsadi_profiles: dict[str, tuple[int, ...]] | None = None,
+) -> str:
     exact_text = text.strip()
     if text in overrides:
         return overrides[text]
     if exact_text in overrides:
         return overrides[exact_text]
-    if text in bwhebb_map:
+    decoded = html.unescape(exact_text)
+
+    def tsadi_profile_for_key(key: str) -> tuple[int, ...] | None:
+        if entry_tsadi_profiles and key in entry_tsadi_profiles:
+            return entry_tsadi_profiles[key]
+        if global_tsadi_profiles and key in global_tsadi_profiles:
+            return global_tsadi_profiles[key]
+        return None
+
+    part_profiles = [
+        (part, tsadi_profile_for_key(bwhebb_source_key(part, bwhebb_map)))
+        for part in source_parts(decoded)
+    ]
+    should_apply_tsadi_override = any(positions is not None for _, positions in part_profiles)
+    should_skip_exact_bwhebb_map = should_apply_tsadi_override and "x" in exact_text
+    if not should_skip_exact_bwhebb_map and text in bwhebb_map:
         return bwhebb_map[text]
-    if exact_text in bwhebb_map:
+    if not should_skip_exact_bwhebb_map and exact_text in bwhebb_map:
         return bwhebb_map[exact_text]
 
-    decoded = html.unescape(exact_text)
-    mapped = "".join(bwhebb_map.get(character, character) for character in decoded)
+    if not should_apply_tsadi_override:
+        mapped = "".join(bwhebb_map.get(character, character) for character in decoded)
+    else:
+        mapped_parts: list[str] = []
+        for part, tsadi_positions in part_profiles:
+            consonant_index = 0
+            mapped_characters: list[str] = []
+            for character in part:
+                mapped_character = bwhebb_map.get(character, character)
+                is_source_consonant = any(is_hebrew_letter(mapped_part) for mapped_part in bwhebb_map.get(character, ""))
+                if character == "x" and tsadi_positions is not None and consonant_index in tsadi_positions:
+                    mapped_character = "צ"
+                mapped_characters.append(mapped_character)
+                if is_source_consonant:
+                    consonant_index += 1
+            mapped_parts.append("".join(mapped_characters))
+        mapped = "".join(mapped_parts)
 
     tokens: list[str] = []
     current = ""
@@ -1054,13 +1157,18 @@ class LexiconHTMLConverter(HTMLParser):
         bwhebb_map: dict[str, str],
         script_overrides: dict[str, dict[str, str]],
         xbr_overrides: dict[str, str],
+        global_x_as_tsadi_profiles: dict[str, tuple[int, ...]],
+        entry_x_as_tsadi_profiles: dict[int, dict[str, tuple[int, ...]]],
     ):
         super().__init__(convert_charrefs=True)
         self.bwhebb_map = bwhebb_map
         self.script_overrides = script_overrides
         self.xbr_overrides = xbr_overrides
+        self.global_x_as_tsadi_profiles = global_x_as_tsadi_profiles
+        self.entry_x_as_tsadi_profiles = entry_x_as_tsadi_profiles
         self.output: list[str] = []
         self.capture_stack: list[dict] = []
+        self.current_entrynum: int | None = None
 
     def append_text(self, text: str) -> None:
         if not text:
@@ -1081,6 +1189,15 @@ class LexiconHTMLConverter(HTMLParser):
 
         if tag == "strongs":
             self.capture_stack.append({"kind": "strongs", "buffer": []})
+            return
+
+        if tag == "entry":
+            self.current_entrynum = None
+            self.output.append(render_start_tag(tag, attrs))
+            return
+
+        if tag == "entrynum":
+            self.capture_stack.append({"kind": "entrynum", "buffer": []})
             return
 
         if tag == "xbr":
@@ -1108,6 +1225,13 @@ class LexiconHTMLConverter(HTMLParser):
         if self.capture_stack and self.capture_stack[-1]["kind"] == "strongs" and tag == "strongs":
             text = "".join(self.capture_stack.pop()["buffer"]).strip()
             self.output.append(f"<span class=\"strongs-number\">{html.escape(text, quote=False)}</span>")
+            return
+
+        if self.capture_stack and self.capture_stack[-1]["kind"] == "entrynum" and tag == "entrynum":
+            text = "".join(self.capture_stack.pop()["buffer"]).strip()
+            if text.isdigit():
+                self.current_entrynum = int(text)
+            self.output.append(f"<entrynum>{html.escape(text, quote=False)}</entrynum>")
             return
 
         if self.capture_stack and self.capture_stack[-1]["kind"] == "xbr" and tag == "xbr":
@@ -1152,7 +1276,13 @@ class LexiconHTMLConverter(HTMLParser):
 
     def convert_span_text(self, script_class: str, text: str) -> str:
         if script_class == "Bwhebb":
-            return convert_bwhebb_text(text, self.bwhebb_map, self.script_overrides.get("Bwhebb", {}))
+            return convert_bwhebb_text(
+                text,
+                self.bwhebb_map,
+                self.script_overrides.get("Bwhebb", {}),
+                global_tsadi_profiles=self.global_x_as_tsadi_profiles,
+                entry_tsadi_profiles=self.entry_x_as_tsadi_profiles.get(self.current_entrynum),
+            )
         if script_class == "greek":
             return convert_greek_text(text, self.script_overrides.get("greek", {}))
         if script_class == "arabic":
@@ -1176,11 +1306,15 @@ def convert_document(
     bwhebb_map: dict[str, str],
     script_overrides: dict[str, dict[str, str]],
     xbr_overrides: dict[str, str],
+    global_x_as_tsadi_profiles: dict[str, tuple[int, ...]],
+    entry_x_as_tsadi_profiles: dict[int, dict[str, tuple[int, ...]]],
 ) -> str:
     parser = LexiconHTMLConverter(
         bwhebb_map=bwhebb_map,
         script_overrides=script_overrides,
         xbr_overrides=xbr_overrides,
+        global_x_as_tsadi_profiles=global_x_as_tsadi_profiles,
+        entry_x_as_tsadi_profiles=entry_x_as_tsadi_profiles,
     )
     parser.feed(normalize_raw_html(raw_html))
     parser.close()
@@ -1328,12 +1462,15 @@ def main() -> None:
     bwhebb_map = load_bwhebb_map(BWHEBB_TSV, BWHEBB_AUTHORITATIVE, BWHEBB_OVERRIDES)
     script_overrides = load_json(SCRIPT_OVERRIDES)
     xbr_overrides = load_json(XBR_OVERRIDES)
+    global_x_as_tsadi_profiles, entry_x_as_tsadi_profiles = load_bwhebb_x_as_tsadi(BWHEBB_X_AS_TSADI)
     raw_html = args.input.read_text(encoding="utf-8")
     converted = convert_document(
         raw_html,
         bwhebb_map=bwhebb_map,
         script_overrides=script_overrides,
         xbr_overrides=xbr_overrides,
+        global_x_as_tsadi_profiles=global_x_as_tsadi_profiles,
+        entry_x_as_tsadi_profiles=entry_x_as_tsadi_profiles,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(converted, encoding="utf-8")

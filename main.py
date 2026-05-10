@@ -1764,15 +1764,21 @@ def render_meta_span(label: str, value: str) -> str:
     return f"<span><b>{html.escape(label)}:</b> {html.escape(value)}</span>"
 
 
-def render_entry_paragraph(entry: ConvertedEntry) -> str:
+def indent_lines(fragment: str, spaces: int) -> str:
+    prefix = " " * spaces
+    return "\n".join(prefix + line if line else line for line in fragment.splitlines())
+
+
+def render_entry_paragraph(entry: ConvertedEntry, indent: int = 0) -> str:
     attrs = entry.paragraph_attrs
-    return f'<p{attrs} data-entrynum="{entry.entrynum}">{entry.body_html}</p>'
+    return f'{" " * indent}<p{attrs} data-entrynum="{entry.entrynum}">{entry.body_html}</p>'
 
 
 def render_section(
     bdb: str,
     lexical_entries: list[LexicalEntry],
     converted_entries: list[ConvertedEntry],
+    indent: int = 0,
 ) -> str:
     words = unique_preserving_order([entry.word for entry in lexical_entries])
     definitions = unique_preserving_order([entry.definition for entry in lexical_entries])
@@ -1797,9 +1803,20 @@ def render_section(
         ("TWOT", ", ".join(twots)),
         ("Lexical IDs", ", ".join(lexical_ids)),
     ]
-    meta = '<div class="entry-meta">' + "".join(render_meta_span(label, value) for label, value in meta_values if value) + "</div>"
-    body = "\n".join(render_entry_paragraph(entry) for entry in converted_entries)
-    return f'<section class="bdb-subentry" data-bdb="{html.escape(bdb)}">\n{heading}\n{summary}\n{meta}\n{body}\n</section>'
+    lines = [
+        f'{" " * indent}<section class="bdb-subentry" data-bdb="{html.escape(bdb)}">',
+        indent_lines(heading, indent + 2),
+    ]
+    if summary:
+        lines.append(indent_lines(summary, indent + 2))
+    meta_spans = [render_meta_span(label, value) for label, value in meta_values if value]
+    if meta_spans:
+        lines.append(f'{" " * (indent + 2)}<div class="entry-meta">')
+        lines.extend(indent_lines(span, indent + 4) for span in meta_spans)
+        lines.append(f'{" " * (indent + 2)}</div>')
+    lines.extend(render_entry_paragraph(entry, indent + 2) for entry in converted_entries)
+    lines.append(f'{" " * indent}</section>')
+    return "\n".join(lines)
 
 
 def canonical_group_entry(group: str, lexical_entries: list[LexicalEntry]) -> LexicalEntry:
@@ -1819,33 +1836,47 @@ def render_article(
     entries_by_bdb: dict[str, list[LexicalEntry]],
     converted_by_bdb: dict[str, list[ConvertedEntry]],
     lexical_entries: list[LexicalEntry],
+    indent: int = 0,
 ) -> str:
     canonical = canonical_group_entry(group, lexical_entries)
     section_html = "\n".join(
-        render_section(bdb, entries_by_bdb.get(bdb, []), converted_by_bdb[bdb])
+        render_section(bdb, entries_by_bdb.get(bdb, []), converted_by_bdb[bdb], indent + 2)
         for bdb in group_bdbs
         if converted_by_bdb.get(bdb)
     )
     definition = f'<p class="article-definition">{html.escape(canonical.definition)}</p>' if canonical.definition else ""
-    return (
-        f'<article class="bdb-entry" id="{bdb_id(group)}" data-bdb-group="{html.escape(group)}">\n'
-        f'<header class="article-header"><h2><span class="bdb-code">{html.escape(group)}</span> '
-        f'<span class="headwords" dir="rtl">{html.escape(canonical.word)}</span></h2>{definition}</header>\n'
-        f"{section_html}\n"
-        "</article>"
-    )
+    lines = [
+        f'{" " * indent}<article class="bdb-entry" id="{bdb_id(group)}" data-bdb-group="{html.escape(group)}">',
+        f'{" " * (indent + 2)}<header class="article-header">',
+        (
+            f'{" " * (indent + 4)}<h2><span class="bdb-code">{html.escape(group)}</span> '
+            f'<span class="headwords" dir="rtl">{html.escape(canonical.word)}</span></h2>'
+        ),
+    ]
+    if definition:
+        lines.append(indent_lines(definition, indent + 4))
+    lines.append(f'{" " * (indent + 2)}</header>')
+    if section_html:
+        lines.append(section_html)
+    lines.append(f'{" " * indent}</article>')
+    return "\n".join(lines)
 
 
-def render_unmapped_entries(unmapped_entries: list[ConvertedEntry]) -> str:
+def render_unmapped_entries(unmapped_entries: list[ConvertedEntry], indent: int = 0) -> str:
     if not unmapped_entries:
         return ""
-    body = "\n".join(render_entry_paragraph(entry) for entry in unmapped_entries)
-    return (
-        '<section class="unmapped-entries" id="unindexed-entries">\n'
-        "<h2>Unindexed Entries</h2>\n"
-        '<p class="article-definition">Entries that could not be confidently aligned with LexicalIndex.xml.</p>\n'
-        f"{body}\n"
-        "</section>"
+    body = "\n".join(render_entry_paragraph(entry, indent + 2) for entry in unmapped_entries)
+    return "\n".join(
+        [
+            f'{" " * indent}<section class="unmapped-entries" id="unindexed-entries">',
+            f'{" " * (indent + 2)}<h2>Unindexed Entries</h2>',
+            (
+                f'{" " * (indent + 2)}<p class="article-definition">'
+                "Entries that could not be confidently aligned with LexicalIndex.xml.</p>"
+            ),
+            body,
+            f'{" " * indent}</section>',
+        ]
     )
 
 
@@ -1971,25 +2002,30 @@ def build_entries_document(converted_html: str, lexical_index_path: Path, entry_
         bdbs_by_group.setdefault(bdb_group(bdb), []).append(bdb)
 
     articles = "\n".join(
-        render_article(group, bdbs, entries_by_bdb, converted_by_bdb, lexical_entries)
+        render_article(group, bdbs, entries_by_bdb, converted_by_bdb, lexical_entries, 6)
         for group, bdbs in sorted(bdbs_by_group.items(), key=lambda item: bdb_sort_key(item[0]))
     )
-    unmapped = render_unmapped_entries(unmapped_entries)
+    unmapped = render_unmapped_entries(unmapped_entries, 6)
+    styles = indent_lines(entries_styles().strip(), 6)
     return (
         "<!DOCTYPE html>\n"
         '<html lang="en">\n'
-        "<head>\n"
-        '<meta charset="utf-8"/>\n'
-        "<title>BDB Entries</title>\n"
-        f"<style>{entries_styles()}</style>\n"
-        "</head>\n"
-        "<body>\n"
-        "<main>\n"
-        '<header class="document-header"><h1>The Brown-Driver-Briggs Hebrew and English Lexicon: Entries</h1></header>\n'
+        "  <head>\n"
+        '    <meta charset="utf-8"/>\n'
+        "    <title>BDB Entries</title>\n"
+        "    <style>\n"
+        f"{styles}\n"
+        "    </style>\n"
+        "  </head>\n"
+        "  <body>\n"
+        "    <main>\n"
+        '      <header class="document-header">\n'
+        '        <h1>The Brown-Driver-Briggs Hebrew and English Lexicon: Entries</h1>\n'
+        "      </header>\n"
         f"{articles}\n"
         f"{unmapped}\n"
-        "</main>\n"
-        "</body>\n"
+        "    </main>\n"
+        "  </body>\n"
         "</html>\n"
     )
 
